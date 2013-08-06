@@ -10,12 +10,6 @@
 				The SHA of an existing commit to fetch.
 			commitcount	Number
 				The number of latest commits to fetch.
-		Return;
-			ret	Table
-				commit	Table
-					The resulting commit data of the tofetch argument
-				commits	Table
-					The resulting commit data of the commitcount argument
 			
 	Setter-functions also exist to facilitate reuse of GitChecker objects.
 	
@@ -38,7 +32,7 @@ local this = GitChecker
 setmetatable(this, {__call = 
 	function(self, repo, commit, commitcount) 
 		if self ~= this then return end
-		local ret = {repo = repo, tofetch = commit, commits = commitcount}
+		local ret = {repo = repo, tofetch = commit, commits = commitcount, fetchregistry = {}}
 		setmetatable(ret, {__index = this})
 		return ret
 	end}
@@ -59,26 +53,23 @@ setmetatable(this, {__call =
 			Table if retrieval was successful, else false
 ]]--
 local function GitFetcher(url)
-	local success, failed, returnedJSON = false, false
-	http.Fetch( url,
-		function(json)
+	local success, json
+	http.Fetch(url,
+		function(retdata, len)
+			print(url, "has delivered!")
 			success = true
-			returnedJSON = json
+			json = util.JSONToTable(retdata)
 		end,
-		
 		function()
-			failed = true
+			print(url, "has NOT delivered!")
+			success = false
 		end
 	)
-	
-	while not (success or failed) do
-		coroutine.wait(0.1)
-		print("Waiting for", url)
-	end
-	
-	print(url, "has", (failed and "NOT" or ""), "delivered!")
-	
-	coroutine.yield(success, success and util.JSONToTable(returnedJSON))
+		
+	return 
+		function()
+			return success, json
+		end
 end
 
 
@@ -111,50 +102,56 @@ end
 
 
 --[[
-	Fetch the data stored in the GitChecker instance.  Execute uses synchronized coroutines and will take a while to complete.
-	It's therefore recommended to use this function in an asynchronous coroutine so Lua isn't blocked.
+	Fetch the data stored in the GitChecker instance.  Execute will return the status code and parsed JSON to the callback when received.
+	The callback may be called multiple times, depending on the configuration of the object.
+	If using the latest-commits feature, the callback should be prepared to receive multiple commits in the same table.
 	Args;
-		repo	String
-			The github repo to fetch from
-		tofetch	String
-			The SHA of an existing commit to fetch.
-		commitcount	Number
-			The number of latest commits to fetch.
-	Return;
-		ret	Table
-			commit	Table
-				The resulting commit data of the tofetch argument
-			commits	Table
-				The resulting commit data of the commitcount argument
+		callback	Function
+			The function to be called upon fetch success.
+	Return (to callback);
+		status	Boolean
+			True if fetch was successful, else false
+		commitdata	Table
+			The resulting commit data from the fetch.
 ]]--
-function this.Execute()
-	if not this.repo then error("This checker instance does not have a repo to check.") return end
+function this:Execute(callback)
+	local repo = self.repo
+	if not repo then error("This checker instance does not have a repo to check.") return end
 	
-	local url, co, ret
-	
+	local commits, tofetch, fetchreg = self.commits, self.tofetch, self.fetchregistry
+	local url
 	
 	if commits and type(commits) == "number" and commits > 0 then
 		url = string.format(GitLatest, repo, commits)
-		co = coroutine.create(GitFetcher(url))
-		
-		success, json = coroutine.resume(co)
+		fetchreg[#fetchreg + 1] = {GitFetcher(url), callback}
+	end
 	
-		if success then
-			ret = {commits = json}
+	if tofetch and type(tofetch) == "table" then
+		for _, v in pairs(tofetch) do
+			url = string.format(GitCommit, repo, v)
+			fetchreg[#fetchreg + 1] = {GitFetcher(url), callback}
 		end
 	end
 	
 	
-	if tofetch and type(tofetch) == "string" then
-		url = string.format(GitCommit, repo, tofetch)
-		co = coroutine.create(GitFetcher(url))
-		
-		success, json = coroutine.resume(co)
-		
-		if success then
-			ret = ret or {}
-			ret.commit = json
-		end
+	local timerid = "GitCommit" .. tostring(self)
+	if not timer.Exists(timerid) then
+		timer.Create(timerid, 0.1, 0, 
+			function()
+				for k, poller in pairs(fetchreg) do
+					local success, json = poller[1]() -- poller
+					if success ~= nil then
+						print("Found that the url has", (success and "" or "NOT"), "delivered!")
+						poller[2](success, json) -- callback
+						fetchreg[k] = nil
+					end
+				end
+				
+				if table.Count(fetchreg) == 0 then
+					timer.Remove(timerid)
+				end
+			end
+		)
 	end
 	
 	return ret
